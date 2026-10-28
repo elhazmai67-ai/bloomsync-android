@@ -1,0 +1,156 @@
+name: Build BloomSync Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - 'BloomSync-Android-Release.zip'
+      - '.github/workflows/build-apk.yml'
+      - 'app/**'
+      - 'tools/**'
+      - 'release-verification/**'
+      - '*.gradle.kts'
+      - 'gradle.properties'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bloomsync-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      ANDROID_VERSION_CODE: ${{ github.run_number }}
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v6
+
+      - name: Open release project
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f BloomSync-Android-Release.zip ]]; then
+            python3 -m zipfile -e BloomSync-Android-Release.zip android-project
+            echo "ANDROID_PROJECT_DIR=$GITHUB_WORKSPACE/android-project/bloomsync-android" >> "$GITHUB_ENV"
+          elif [[ -f app/build.gradle.kts ]]; then
+            echo "ANDROID_PROJECT_DIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          else
+            echo '::error::Upload BloomSync-Android-Release.zip at the repository root.'
+            exit 1
+          fi
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Load permanent signing key
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Add the missing Actions secret: $name. See the private signing backup."
+              exit 1
+            fi
+          done
+          KEY_PATH="$RUNNER_TEMP/bloomsync-release.p12"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$KEY_PATH"
+          keytool -exportcert -keystore "$KEY_PATH" -storetype PKCS12 -alias "$ANDROID_KEY_ALIAS" -storepass:env ANDROID_KEYSTORE_PASSWORD -file "$RUNNER_TEMP/bloomsync-certificate.der"
+          python3 - <<'PY'
+          import hashlib, os, pathlib
+          certificate = pathlib.Path(os.environ['RUNNER_TEMP']) / 'bloomsync-certificate.der'
+          expected_file = pathlib.Path(os.environ['ANDROID_PROJECT_DIR']) / 'release-verification/certificate-sha256.txt'
+          actual = hashlib.sha256(certificate.read_bytes()).hexdigest().upper()
+          expected = expected_file.read_text().strip().replace(':', '').upper()
+          if actual != expected:
+              raise SystemExit('Signing certificate does not match this release project. Reuse the supplied permanent signing backup.')
+          print('Permanent signing certificate matches the website verification setup.')
+          PY
+          echo "ANDROID_KEYSTORE_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Set up Gradle 8.13
+        uses: gradle/actions/setup-gradle@017a9effdb900e5b5b2fddfb590a105619dca3c3 # v4.4.2
+        with:
+          gradle-version: '8.13'
+
+      - name: Install Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'platforms;android-36' 'build-tools;35.0.0' 'platform-tools'
+
+      - name: Test startup and build signed APK and AAB
+        working-directory: ${{ env.ANDROID_PROJECT_DIR }}
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          python3 tools/check_project.py
+          gradle --no-daemon :app:testReleaseUnitTest :app:assembleRelease :app:bundleRelease :app:lintRelease
+
+      - name: Upload startup test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BloomSync-Startup-Tests-${{ github.run_number }}
+          path: |
+            ${{ env.ANDROID_PROJECT_DIR }}/app/build/reports/tests/testReleaseUnitTest/
+            ${{ env.ANDROID_PROJECT_DIR }}/app/build/test-results/testReleaseUnitTest/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Verify release and prepare download
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          cp "$ANDROID_PROJECT_DIR/app/build/outputs/apk/release/app-release.apk" output/BloomSync.apk
+          cp "$ANDROID_PROJECT_DIR/app/build/outputs/bundle/release/app-release.aab" output/BloomSync.aab
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs output/BloomSync.apk > output/certificate.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging output/BloomSync.apk > output/apk-info.txt
+          python3 - <<'PY'
+          import pathlib
+          info = pathlib.Path('output/apk-info.txt').read_text()
+          assert "package: name='com.bloomsync.companion'" in info, 'Unexpected app package'
+          assert "application-label:'BloomSync'" in info, 'Unexpected app name'
+          assert "versionName='1.0.1'" in info, 'Expected startup-fix release 1.0.1'
+          assert 'application-debuggable' not in info, 'A release must not be debuggable'
+          print('Verified BloomSync release package, label and non-debuggable APK.')
+          PY
+          python3 "$ANDROID_PROJECT_DIR/tools/make_assetlinks.py" --certificate-file output/certificate.txt --package com.bloomsync.companion --output output/assetlinks.json
+          cp "$ANDROID_PROJECT_DIR/docs/INSTALL.txt" output/INSTALL.txt
+          (cd output && sha256sum BloomSync.apk BloomSync.aab > SHA256SUMS.txt)
+          {
+            echo '### BloomSync signed release'
+            echo 'Download the BloomSync-Release artifact, extract it and install BloomSync.apk.'
+            echo 'BloomSync.aab is included for a separate Play Console publishing process.'
+            echo 'The app uses the live BloomSync website; Android device login, pairing and fullscreen checks remain necessary.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release files
+        uses: actions/upload-artifact@v4
+        with:
+          name: BloomSync-Release-${{ github.run_number }}
+          path: output/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove temporary signing files
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/bloomsync-release.p12" "$RUNNER_TEMP/bloomsync-certificate.der"
